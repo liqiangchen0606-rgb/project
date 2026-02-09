@@ -64,7 +64,7 @@ SYSTEM_PROMPT = """
 You are a market research assistant for a corporate business analyst.
 
 Rules:
-- Write an industry report under 500 words.
+- Write an industry report under 500 words. Aim for 430–480 words to cover key points.
 - Use ONLY the provided Wikipedia extracts and URLs as evidence.
 - Do NOT invent facts. If the sources do not specify something, say so.
 - Keep the tone clear, professional, and business-oriented.
@@ -120,6 +120,63 @@ Write the industry report now, following the required headings and staying under
 """.strip()
 
     return user_prompt
+
+
+def detect_abbreviation(term: str, api_key: str, model_name: str) -> dict:
+    """
+    Use LLM to detect whether the term is an abbreviation and suggest a VALID industry name.
+    Returns: {"is_abbrev": bool, "expanded": str}
+    """
+    if not api_key or not model_name:
+        return {"is_abbrev": False, "expanded": ""}
+
+    try:
+        llm = ChatGoogleGenerativeAI(
+            model=model_name,
+            google_api_key=api_key,
+            temperature=0.0,
+            max_output_tokens=80
+        )
+        llm_prompt = f"""
+If the term is a COMMON abbreviation in business/industry contexts, expand it into a VALID industry name.
+The expanded value MUST be a clear industry/sector/market phrase and include
+the word "industry", "sector", or "market".
+If it is not a common abbreviation or is unclear, answer no.
+Return ONLY JSON: {{"is_abbrev":"yes|no","expanded":"...","confidence":"0-1"}}
+Term: {term}
+""".strip()
+        result = llm.invoke([("user", llm_prompt)])
+        content = result.content
+        if isinstance(content, dict):
+            content = content.get("text", str(content))
+        elif isinstance(content, list):
+            content = "".join([str(c) for c in content])
+        text = content.strip()
+        is_abbrev_match = re.search(r'"is_abbrev"\s*:\s*"(yes|no)"', text, re.IGNORECASE)
+        expanded_match = re.search(r'"expanded"\s*:\s*"([^"]*)"', text, re.IGNORECASE)
+        conf_match = re.search(r'"confidence"\s*:\s*"?(0(?:\.\d+)?|1(?:\.0+)?)"?', text, re.IGNORECASE)
+        conf = float(conf_match.group(1)) if conf_match else 0.0
+        if is_abbrev_match and is_abbrev_match.group(1).lower() == "yes" and expanded_match and conf >= 0.7:
+            expanded = expanded_match.group(1).strip()
+            if expanded:
+                # Require explicit industry/sector/market wording
+                if re.search(r"\b(industry|sector|market)\b", expanded.lower()):
+                    # Verify the expanded term looks like a real industry via Wikipedia evidence
+                    retriever = WikipediaRetriever(top_k_results=3, lang="en")
+                    docs = retriever.invoke(expanded)
+                    evidence_ok = False
+                    for d in docs:
+                        title = (d.metadata.get("title", "") or "").lower()
+                        content = (d.page_content or "").lower()[:400]
+                        if any(k in title or k in content for k in ["industry", "sector", "market"]):
+                            evidence_ok = True
+                            break
+                    if evidence_ok:
+                        return {"is_abbrev": True, "expanded": expanded}
+    except Exception:
+        pass
+
+    return {"is_abbrev": False, "expanded": ""}
 
 
 # =========================================================
@@ -234,7 +291,9 @@ def find_similar_industry(invalid_input: str, api_key: str = "", model_name: str
             )
             llm_prompt = f"""
 The user entered an invalid industry term: "{invalid_input}".
-Suggest 3 valid industries they might have meant (fix typos if likely).
+Suggest 3 VALID industry names they might have meant (fix typos if likely).
+Each suggestion must be a real industry/sector/market and include the word
+"industry", "sector", or "market".
 Return ONLY a comma-separated list of industries.
 """.strip()
             result = llm.invoke([("user", llm_prompt)])
@@ -248,7 +307,24 @@ Return ONLY a comma-separated list of industries.
             text = re.sub(r"[\n;]+", ", ", text)
             text = re.sub(r"^[-*\d\.\s]+", "", text)
             if len(text) > 0:
-                return text
+                # Verify suggestions via Wikipedia
+                parts = [p.strip() for p in text.split(",") if p.strip()]
+                valid = []
+                retriever = WikipediaRetriever(top_k_results=3, lang="en")
+                for p in parts:
+                    if not re.search(r"\b(industry|sector|market)\b", p.lower()):
+                        continue
+                    docs = retriever.invoke(p)
+                    for d in docs:
+                        title = (d.metadata.get("title", "") or "").lower()
+                        content = (d.page_content or "").lower()[:400]
+                        if any(k in title or k in content for k in ["industry", "sector", "market"]):
+                            valid.append(p)
+                            break
+                    if len(valid) >= 3:
+                        break
+                if valid:
+                    return ", ".join(valid)
         except Exception:
             pass
     # Common industries as reference
@@ -480,7 +556,11 @@ industry = st.text_input(
     placeholder="e.g., electric vehicles, luxury retail, fintech"
 )
 
-if st.button("Generate report"):
+generate_clicked = st.button("Generate report")
+if generate_clicked:
+    st.session_state["pending_generate"] = True
+
+if st.session_state.get("pending_generate", False):
 
     # -------------------------
     # Q1: Input validation
@@ -489,16 +569,46 @@ if st.button("Generate report"):
         st.warning("Please enter an industry.")
         st.stop()
 
+    # Abbreviation confirmation (LLM-assisted)
+    if "abbr_input" not in st.session_state or st.session_state.get("abbr_input") != industry:
+        st.session_state["abbr_input"] = industry
+        st.session_state["abbr_done"] = False
+        st.session_state["abbr_resolved"] = industry
+
+    if not st.session_state.get("abbr_done", False):
+        abbr = detect_abbreviation(industry, api_key=api_key, model_name=model_name)
+        if abbr.get("is_abbrev") and abbr.get("expanded"):
+            st.info(f'Did you mean "{abbr["expanded"]}"?')
+            st.caption("Recommended: use the expanded industry name for better accuracy.")
+            c1, c2 = st.columns(2)
+            yes_clicked = c1.button(f'Yes (Recommended), use "{abbr["expanded"]}"')
+            no_clicked = c2.button("No, keep original")
+            c2.warning("Using abbreviations may lead to less accurate results.")
+            if yes_clicked:
+                st.session_state["abbr_resolved"] = abbr["expanded"]
+                st.session_state["abbr_done"] = True
+                st.session_state["pending_generate"] = True
+            elif no_clicked:
+                st.session_state["abbr_resolved"] = industry
+                st.session_state["abbr_done"] = True
+                st.session_state["pending_generate"] = True
+            else:
+                st.stop()
+        else:
+            st.session_state["abbr_done"] = True
+
+    industry_to_use = st.session_state.get("abbr_resolved", industry)
+
     # Validate that input is actually an industry
     is_valid, suggestion = validate_industry(
-        industry,
+        industry_to_use,
         top_k=5,
         api_key=api_key,
         model_name=model_name
     )
     
     if not is_valid:
-        st.error(f"❌ '{industry}' does not appear to be a valid industry.")
+        st.error(f"❌ '{industry_to_use}' does not appear to be a valid industry.")
         if suggestion:
             st.info(f"💡 Did you mean one of these? Try: **{suggestion}**")
         st.stop()
@@ -507,7 +617,7 @@ if st.button("Generate report"):
     # Q2: Wikipedia retrieval
     # -------------------------
     with st.spinner("Retrieving Wikipedia pages..."):
-        docs = retrieve_wikipedia(industry, top_k=5)
+        docs = retrieve_wikipedia(industry_to_use, top_k=5)
 
     urls = extract_urls(docs)
 
@@ -526,7 +636,7 @@ if st.button("Generate report"):
         st.error("Missing API key. Please set GOOGLE_API_KEY.")
         st.stop()
 
-    user_prompt = build_user_prompt(industry, docs)
+    user_prompt = build_user_prompt(industry_to_use, docs)
 
     with st.spinner("Generating industry report..."):
         report = generate_report(
@@ -542,3 +652,4 @@ if st.button("Generate report"):
     st.subheader("Q3 — Industry Report (<500 words)")
     st.write(report)
     st.caption(f"Word count: {word_count(report)}")
+    st.session_state["pending_generate"] = False
