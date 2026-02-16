@@ -67,6 +67,7 @@ Rules:
 - Write an industry report under 500 words. Aim for 430–480 words to cover key points.
 - Use ONLY the provided Wikipedia extracts and URLs as evidence.
 - Do NOT invent facts. If the sources do not specify something, say so.
+- Every factual sentence must include at least one citation tag: [S1], [S2], [S3], [S4], or [S5].
 - Keep the tone clear, professional, and business-oriented.
 
 Output format (use these headings):
@@ -104,7 +105,7 @@ def build_user_prompt(industry: str, docs: list) -> str:
         extract = extract[:1200]
 
         sources_block.append(
-            f"{i}) {title}\nURL: {url}\nExtract: {extract}\n"
+            f"[S{i}] {title}\nURL: {url}\nExtract: {extract}\n"
         )
 
     sources_text = "\n".join(sources_block)
@@ -117,9 +118,48 @@ Wikipedia sources (use ONLY these):
 
 Task:
 Write the industry report now, following the required headings and staying under 500 words.
+Use only these extracts. Add [S#] citation tags to each factual sentence.
 """.strip()
 
     return user_prompt
+
+
+# =========================================================
+# 3b. LLM Utility (consistent parsing for JSON-like replies)
+# =========================================================
+
+def _invoke_llm_json(llm: ChatGoogleGenerativeAI, prompt: str) -> str:
+    """
+    Invoke the LLM and return raw text for downstream JSON parsing.
+    This keeps all LLM calls consistent and easy to audit.
+    """
+    result = llm.invoke([("user", prompt)])
+    content = result.content
+    if isinstance(content, dict):
+        content = content.get("text", str(content))
+    elif isinstance(content, list):
+        content = "".join([str(c) for c in content])
+    return str(content).strip()
+
+
+def validate_api_key(api_key: str, model_name: str) -> bool:
+    """
+    Fast key check before running the full app pipeline.
+    Returns True if the key can successfully call the selected model.
+    """
+    if not api_key or not model_name:
+        return False
+    try:
+        llm = ChatGoogleGenerativeAI(
+            model=model_name,
+            google_api_key=api_key,
+            temperature=0.0,
+            max_output_tokens=8
+        )
+        _invoke_llm_json(llm, "Reply with OK.")
+        return True
+    except Exception:
+        return False
 
 
 def detect_abbreviation(term: str, api_key: str, model_name: str) -> dict:
@@ -145,13 +185,7 @@ If it is not a common abbreviation or is unclear, answer no.
 Return ONLY JSON: {{"is_abbrev":"yes|no","expanded":"...","confidence":"0-1"}}
 Term: {term}
 """.strip()
-        result = llm.invoke([("user", llm_prompt)])
-        content = result.content
-        if isinstance(content, dict):
-            content = content.get("text", str(content))
-        elif isinstance(content, list):
-            content = "".join([str(c) for c in content])
-        text = content.strip()
+        text = _invoke_llm_json(llm, llm_prompt)
         is_abbrev_match = re.search(r'"is_abbrev"\s*:\s*"(yes|no)"', text, re.IGNORECASE)
         expanded_match = re.search(r'"expanded"\s*:\s*"([^"]*)"', text, re.IGNORECASE)
         conf_match = re.search(r'"confidence"\s*:\s*"?(0(?:\.\d+)?|1(?:\.0+)?)"?', text, re.IGNORECASE)
@@ -192,31 +226,7 @@ def validate_industry(industry: str, top_k: int = 5, api_key: str = "", model_na
     
     Returns: (is_valid: bool, suggestion: str or None)
     """
-    def normalize_tokens(text: str) -> list:
-        return re.findall(r"[a-zA-Z]+", text.lower())
-
-    def is_disambiguation(title: str, content: str) -> bool:
-        title_l = title.lower()
-        content_l = content.lower()
-        return "(disambiguation)" in title_l or "may refer to" in content_l[:400]
-
-    input_lower = industry.lower().strip()
-    tokens = normalize_tokens(input_lower)
-
-    # Simple guardrail for color-only inputs
-    if tokens in (["red"], ["blue"], ["green"], ["yellow"], ["purple"], ["orange"],
-                  ["black"], ["white"], ["brown"], ["pink"], ["gray"], ["grey"],
-                  ["cyan"], ["magenta"], ["gold"], ["silver"]) or \
-       tokens in (["red", "industry"], ["blue", "industry"], ["green", "industry"],
-                  ["yellow", "industry"], ["purple", "industry"], ["orange", "industry"],
-                  ["black", "industry"], ["white", "industry"], ["brown", "industry"],
-                  ["pink", "industry"], ["gray", "industry"], ["grey", "industry"],
-                  ["cyan", "industry"], ["magenta", "industry"], ["gold", "industry"],
-                  ["silver", "industry"]):
-        suggestion = find_similar_industry(industry, api_key=api_key, model_name=model_name)
-        return False, suggestion
-
-    # 1) LLM decision first (if available)
+    # LLM-only decision path (simple and final when available).
     if api_key and model_name:
         try:
             llm = ChatGoogleGenerativeAI(
@@ -226,50 +236,47 @@ def validate_industry(industry: str, top_k: int = 5, api_key: str = "", model_na
                 max_output_tokens=200
             )
             llm_prompt = f"""
-Is this a valid INDUSTRY? Answer ONLY in JSON:
-{{"is_industry": "yes" or "no", "reason": "short reason"}}
+Classify whether this term is a valid industry (economic sector/market).
+Answer ONLY in JSON:
+{{"is_industry":"yes|no"}}
 Term: {industry}
-If unclear or not an economic sector/market, answer "no".
+Normalization guidance:
+- Treat spacing, hyphen, and spelling variants as equivalent when they refer to the same sector
+  (e.g., "healthcare" = "health care", "e-commerce" = "ecommerce").
+Decision rules:
+- "yes" only if it is a broad economic sector/market with many firms (e.g., healthcare, banking, automotive, retail).
+- "no" for sports/hobbies/topics, colors/random text, specific products, company names, or narrow store formats.
+- "no" for single activity domains that are not commonly treated as an industry label.
+Examples:
+- "healthcare" -> yes
+- "automotive industry" -> yes
+- "basketball" -> no
+- "luxury department store" -> no
+- "cars" -> no
+- "glasses" -> no
+- "phone" -> no
+- "red industry" -> no
+- "kk" -> no
+If unclear, answer "no".
 """.strip()
-            result = llm.invoke([("user", llm_prompt)])
-            content = result.content
-            if isinstance(content, dict):
-                content = content.get("text", str(content))
-            elif isinstance(content, list):
-                content = "".join([str(c) for c in content])
-            text = content.strip()
-            is_industry_match = re.search(r'"is_industry"\\s*:\\s*"(yes|no)"', text, re.IGNORECASE)
+            text = _invoke_llm_json(llm, llm_prompt)
+            is_industry_match = re.search(r'"is_industry"\s*:\s*"(yes|no)"', text, re.IGNORECASE)
+            if is_industry_match and is_industry_match.group(1).lower() == "yes":
+                return True, None
             if is_industry_match and is_industry_match.group(1).lower() == "no":
                 suggestion = find_similar_industry(industry, api_key=api_key, model_name=model_name)
                 return False, suggestion
+            # Unparseable response: fail closed.
+            suggestion = find_similar_industry(industry, api_key=api_key, model_name=model_name)
+            return False, suggestion
         except Exception:
-            pass
+            # LLM error: fail closed to avoid false positives.
+            suggestion = find_similar_industry(industry, api_key=api_key, model_name=model_name)
+            return False, suggestion
 
-    # 2) Wikipedia must return relevant pages
-    retriever = WikipediaRetriever(top_k_results=top_k, lang="en")
-    docs = retriever.invoke(industry)
-    docs = [d for d in docs if not is_disambiguation(d.metadata.get("title", ""), d.page_content or "")]
-    if not docs:
-        suggestion = find_similar_industry(industry, api_key=api_key, model_name=model_name)
-        return False, suggestion
-
-    # Require some sign of "industry/sector/market" in top results
-    evidence_ok = False
-    for d in docs[:5]:
-        title = (d.metadata.get("title", "") or "").lower()
-        content = (d.page_content or "").lower()[:400]
-        if "industry" in title or "sector" in title or "market" in title:
-            evidence_ok = True
-            break
-        if "industry" in content or "sector" in content or "market" in content:
-            evidence_ok = True
-            break
-
-    if not evidence_ok:
-        suggestion = find_similar_industry(industry, api_key=api_key, model_name=model_name)
-        return False, suggestion
-
-    return True, None
+    # No LLM configured.
+    suggestion = find_similar_industry(industry, api_key=api_key, model_name=model_name)
+    return False, suggestion
 
 
 def find_similar_industry(invalid_input: str, api_key: str = "", model_name: str = "") -> str:
@@ -281,12 +288,13 @@ def find_similar_industry(invalid_input: str, api_key: str = "", model_name: str
     - Fallback string similarity on a common industry list
     Returns top suggestions for the user.
     """
+    # LLM-based suggestions (preferred, more robust to typos)
     if api_key and model_name:
         try:
             llm = ChatGoogleGenerativeAI(
                 model=model_name,
                 google_api_key=api_key,
-                temperature=0.2,
+                temperature=0.0,
                 max_output_tokens=60
             )
             llm_prompt = f"""
@@ -294,15 +302,12 @@ The user entered an invalid industry term: "{invalid_input}".
 Suggest 3 VALID industry names they might have meant (fix typos if likely).
 Each suggestion must be a real industry/sector/market and include the word
 "industry", "sector", or "market".
+If the input looks like a product/object (e.g., cars, glasses, phone), map it to
+the closest relevant industry terms (e.g., automotive industry, eyewear industry,
+telecommunications industry) instead of repeating the product word.
 Return ONLY a comma-separated list of industries.
 """.strip()
-            result = llm.invoke([("user", llm_prompt)])
-            content = result.content
-            if isinstance(content, dict):
-                content = content.get("text", str(content))
-            elif isinstance(content, list):
-                content = "".join([str(c) for c in content])
-            text = content.strip()
+            text = _invoke_llm_json(llm, llm_prompt)
             # Basic cleanup to ensure a simple list
             text = re.sub(r"[\n;]+", ", ", text)
             text = re.sub(r"^[-*\d\.\s]+", "", text)
@@ -327,6 +332,7 @@ Return ONLY a comma-separated list of industries.
                     return ", ".join(valid)
         except Exception:
             pass
+    # Heuristic fallback (only if LLM is unavailable)
     # Common industries as reference
     common_industries = [
         "technology", "healthcare", "finance", "retail", "manufacturing",
@@ -411,6 +417,60 @@ def retrieve_wikipedia(industry: str, top_k: int = 5):
     return docs
 
 
+def select_top_docs_with_llm(industry: str, docs: list, api_key: str, model_name: str, k: int = 5) -> list:
+    """
+    Second-layer ranking: ask the LLM to choose the top-k most relevant pages
+    from a larger retrieved set. Falls back to the first k docs on any failure.
+    """
+    if not docs:
+        return []
+    if not api_key or not model_name:
+        return docs[:k]
+
+    try:
+        llm = ChatGoogleGenerativeAI(
+            model=model_name,
+            google_api_key=api_key,
+            temperature=0.0,
+            max_output_tokens=180
+        )
+
+        candidates = []
+        for i, d in enumerate(docs, start=1):
+            title = d.metadata.get("title", "Unknown title")
+            url = d.metadata.get("source", "")
+            extract = (d.page_content or "").strip()[:350]
+            candidates.append(f"{i}) {title}\nURL: {url}\nExtract: {extract}")
+
+        llm_prompt = f"""
+Pick the {k} most relevant Wikipedia pages for industry market research.
+Return ONLY JSON: {{"indices":[1,2,3,4,5]}}
+Industry: {industry}
+
+Candidates:
+{chr(10).join(candidates)}
+""".strip()
+
+        text = _invoke_llm_json(llm, llm_prompt)
+        match = re.search(r'"indices"\s*:\s*\[([^\]]+)\]', text)
+        if not match:
+            return docs[:k]
+
+        indices = [int(x) for x in re.findall(r"\d+", match.group(1))]
+        selected = []
+        seen = set()
+        for idx in indices:
+            if 1 <= idx <= len(docs) and idx not in seen:
+                selected.append(docs[idx - 1])
+                seen.add(idx)
+            if len(selected) == k:
+                break
+
+        return selected if len(selected) == k else docs[:k]
+    except Exception:
+        return docs[:k]
+
+
 def extract_urls(docs: list) -> list:
     """
     Extracts and deduplicates Wikipedia URLs from retrieved documents.
@@ -436,10 +496,12 @@ def extract_urls(docs: list) -> list:
 # =========================================================
 
 def word_count(text: str) -> int:
-    """Utility function to count words in report text (excludes URLs)."""
-    # Remove URLs from text before counting
-    text_without_urls = re.sub(r'https?://\S+', '', text)
-    return len(re.findall(r"\b\w+\b", text_without_urls))
+    """Count words in the report body only (exclude sources section and URLs)."""
+    # Drop section 6 / sources block from counting.
+    body_only = re.sub(r"(?is)\n\s*(\*\*)?\s*(6[\)\.\:]?\s*)?sources\s*(\*\*)?\s*.*$", "", text).strip()
+    # Remove any remaining URLs.
+    body_only = re.sub(r'https?://\S+', '', body_only)
+    return len(re.findall(r"\b\w+\b", body_only))
 
 
 def generate_report(model_name: str, api_key: str, system_prompt: str, user_prompt: str) -> str:
@@ -480,7 +542,7 @@ def generate_report(model_name: str, api_key: str, system_prompt: str, user_prom
     llm = ChatGoogleGenerativeAI(
         model=model_name,
         google_api_key=api_key,
-        temperature=0.3,          # Lower temperature for factual consistency
+        temperature=0.0,          # Deterministic output for stricter grounding
         max_output_tokens=650     # Allows space while still enforcing word cap
     )
 
@@ -492,6 +554,48 @@ def generate_report(model_name: str, api_key: str, system_prompt: str, user_prom
     result = llm.invoke(messages)
     response = extract_text(result.content).strip()
     return response
+
+
+def enforce_grounded_rewrite(model_name: str, api_key: str, system_prompt: str, user_prompt: str, draft_report: str) -> str:
+    """
+    Second pass: remove/repair unsupported claims and keep only source-grounded content.
+    """
+    llm = ChatGoogleGenerativeAI(
+        model=model_name,
+        google_api_key=api_key,
+        temperature=0.0,
+        max_output_tokens=700
+    )
+
+    rewrite_prompt = f"""
+Rewrite the draft report so every factual statement is supported by the provided source extracts.
+Hard constraints:
+- Use ONLY information from the provided sources.
+- Remove unsupported statements.
+- Keep required headings (1-6).
+- Keep under 500 words.
+- Add [S1]-[S5] citations to each factual sentence.
+- If a detail is missing from sources, explicitly say it is not specified in the sources.
+
+Draft report:
+{draft_report}
+
+Sources context:
+{user_prompt}
+""".strip()
+
+    if "gemma" in model_name.lower():
+        messages = [("user", f"{system_prompt}\n\n{rewrite_prompt}")]
+    else:
+        messages = [("system", system_prompt), ("user", rewrite_prompt)]
+
+    result = llm.invoke(messages)
+    content = result.content
+    if isinstance(content, dict):
+        content = content.get("text", str(content))
+    elif isinstance(content, list):
+        content = "".join([str(c) for c in content])
+    return str(content).strip()
 
 
 def enforce_under_500_words(report: str) -> str:
@@ -513,9 +617,12 @@ def ensure_sources_section(report: str, urls: list) -> str:
     Ensures a complete Sources section with the provided URLs.
     Replaces any existing Sources section to avoid partial lists.
     """
-    clean = re.sub(r"(?is)\bSources\b.*$", "", report).strip()
+    # Remove any trailing section 6 / sources block that the model may already produce.
+    clean = re.sub(r"(?is)\n\s*(\*\*)?\s*6[\)\.\:]?\s*(sources)?\s*(\*\*)?\s*.*$", "", report).strip()
+    # Also remove a trailing standalone "Sources" heading block if present.
+    clean = re.sub(r"(?is)\n\s*(\*\*)?\s*sources\s*(\*\*)?\s*.*$", "", clean).strip()
     sources_lines = "\n".join(urls[:5])
-    return f"{clean}\n\nSources\n{sources_lines}".strip()
+    return f"{clean}\n\n### 6) Sources\n{sources_lines}".strip()
 
 
 # =========================================================
@@ -544,19 +651,22 @@ api_key = st.sidebar.text_input("Google API key", type="password").strip()
 model_name = st.sidebar.selectbox(
     "Choose an LLM:",
     [
-        "gemma-3-4b-it",
-        "gemma-3-27b-it",
-        "gemini-3-flash-preview"
+        "gemma-3-27b-it"
     ],
     index=0
 )
 
+industry_locked = not bool(api_key)
 industry = st.text_input(
     "Industry",
-    placeholder="e.g., electric vehicles, luxury retail, fintech"
+    placeholder="e.g., electric vehicles, luxury retail, fintech",
+    disabled=industry_locked
 )
 
-generate_clicked = st.button("Generate report")
+if industry_locked:
+    st.info("Enter your Google API key in the sidebar to enable industry input.")
+
+generate_clicked = st.button("Generate report", disabled=industry_locked)
 if generate_clicked:
     st.session_state["pending_generate"] = True
 
@@ -565,11 +675,17 @@ if st.session_state.get("pending_generate", False):
     # -------------------------
     # Q1: Input validation
     # -------------------------
+    if not validate_api_key(api_key, model_name):
+        st.error("Invalid API key")
+        st.session_state["pending_generate"] = False
+        st.stop()
+
     if industry.strip() == "":
         st.warning("Please enter an industry.")
         st.stop()
 
     # Abbreviation confirmation (LLM-assisted)
+    # Rationale: let the user confirm a likely expansion before validation.
     if "abbr_input" not in st.session_state or st.session_state.get("abbr_input") != industry:
         st.session_state["abbr_input"] = industry
         st.session_state["abbr_done"] = False
@@ -600,6 +716,7 @@ if st.session_state.get("pending_generate", False):
     industry_to_use = st.session_state.get("abbr_resolved", industry)
 
     # Validate that input is actually an industry
+    # Rationale: ensures Q1 is satisfied before retrieval and reporting.
     is_valid, suggestion = validate_industry(
         industry_to_use,
         top_k=5,
@@ -615,9 +732,17 @@ if st.session_state.get("pending_generate", False):
 
     # -------------------------
     # Q2: Wikipedia retrieval
+    # Rationale: gather sources for both URL display and report grounding.
     # -------------------------
     with st.spinner("Retrieving Wikipedia pages..."):
-        docs = retrieve_wikipedia(industry_to_use, top_k=5)
+        candidate_docs = retrieve_wikipedia(industry_to_use, top_k=10)
+        docs = select_top_docs_with_llm(
+            industry=industry_to_use,
+            docs=candidate_docs,
+            api_key=api_key,
+            model_name=model_name,
+            k=5
+        )
 
     urls = extract_urls(docs)
 
@@ -631,6 +756,7 @@ if st.session_state.get("pending_generate", False):
 
     # -------------------------
     # Q3: Report generation
+    # Rationale: generate a grounded report using only retrieved extracts.
     # -------------------------
     if not api_key:
         st.error("Missing API key. Please set GOOGLE_API_KEY.")
@@ -646,6 +772,13 @@ if st.session_state.get("pending_generate", False):
             user_prompt=user_prompt
         )
 
+        report = enforce_grounded_rewrite(
+            model_name=model_name,
+            api_key=api_key,
+            system_prompt=SYSTEM_PROMPT,
+            user_prompt=user_prompt,
+            draft_report=report
+        )
         report = enforce_under_500_words(report)
         report = ensure_sources_section(report, urls)
 
